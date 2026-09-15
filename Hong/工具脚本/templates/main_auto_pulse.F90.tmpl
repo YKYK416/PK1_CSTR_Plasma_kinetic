@@ -1,0 +1,302 @@
+! ============================================================
+! MAIN_AUTO_PULSE — 通用脉冲放电主程序（zdp_gui 向导生成，模板渲染，勿手改本标记行）
+!
+! 方波 E/N(t) 脉冲驱动；CLI: Tgas_K EN_on_Td EN_off_Td freq_Hz duty n_cycles_max tag [ATOL RTOL TAU_RES_S]
+! 初始气体组成在生成时写入（摩尔分数 × 总密度）；电子密度全程恒定（等价 ne_mode='fix'）
+! 输出: pulse_series_<tag>.csv（时间序列，phase: 0=起点 1=放电 2=余辉）
+!       pulse_cycles_<tag>.csv（周期汇总，on/off NH3 与能量分列）
+!       pulse_rates_<tag>.csv（每个积分子步的时间分辨反应速率）
+! （输出开关块标记仅为注释，生成时已移除，不影响编译）
+! ============================================================
+program main_auto_pulse
+  use ZDPlasKin
+  implicit none
+
+  double precision :: time, phase_len, t_period, t_on, t_off, next_progress
+  double precision :: ntot, Te_K, EN_now, p_tot
+  double precision :: rates(reactions_max)
+  double precision :: Tgas, EN_on, EN_off, freq, duty
+  double precision :: atol_in, rtol_in, ne0
+  double precision :: nh3_start, nh3_mid, nh3_end, e_on, e_off
+  double precision :: dnh3_tot, dnh3_on, dnh3_off
+  double precision :: e_cycle, e_cycle_prev, rel_dnh3, rel_energy, rel_state_max
+  double precision :: conv_rtol, monitor_floor, denom, density_prev(species_max)
+  double precision :: tau_res, feed_density(species_max)
+  integer :: i, u, uc, ur, iargc, k, n_max, n_sub_on, n_sub_off, cycles_used
+  integer :: converged, nh3_idx, stable_streak, min_cycles, stable_required, flow_enabled
+  character(len=128) :: arg, tag, series_csv, cycles_csv, rates_csv
+
+  ! ---------- 默认值（生成时写入；命令行参数可覆盖） ----------
+  Tgas   = {{TG}}
+  EN_on  = {{EN_ON}}
+  EN_off = {{EN_OFF}}
+  freq   = {{FREQ}}
+  duty   = {{DUTY}}
+  n_max  = {{CYCLES}}
+  tag    = ''
+  atol_in = 1.0d0
+  rtol_in = 1.0d-4
+  ne0    = {{NE}}
+  tau_res = 0.0d0
+  conv_rtol = 1.0d-3
+  min_cycles = 6
+  stable_required = 3
+
+  if (iargc() .ge. 1) then; call getarg(1, arg); read(arg, *) Tgas;   end if
+  if (iargc() .ge. 2) then; call getarg(2, arg); read(arg, *) EN_on;  end if
+  if (iargc() .ge. 3) then; call getarg(3, arg); read(arg, *) EN_off; end if
+  if (iargc() .ge. 4) then; call getarg(4, arg); read(arg, *) freq;   end if
+  if (iargc() .ge. 5) then; call getarg(5, arg); read(arg, *) duty;   end if
+  if (iargc() .ge. 6) then; call getarg(6, arg); read(arg, *) n_max;  end if
+  if (iargc() .ge. 7) then; call getarg(7, arg); tag = arg;           end if
+  if (iargc() .ge. 8) then; call getarg(8, arg); read(arg, *) atol_in; end if
+  if (iargc() .ge. 9) then; call getarg(9, arg); read(arg, *) rtol_in; end if
+  if (iargc() .ge. 10) then; call getarg(10, arg); read(arg, *) tau_res; end if
+
+  series_csv = 'pulse_series.csv'
+  cycles_csv = 'pulse_cycles.csv'
+  rates_csv  = 'pulse_rates.csv'
+  if (len_trim(tag) .gt. 0) then
+    series_csv = 'pulse_series_' // trim(tag) // '.csv'
+    cycles_csv = 'pulse_cycles_' // trim(tag) // '.csv'
+    rates_csv  = 'pulse_rates_'  // trim(tag) // '.csv'
+  end if
+
+  t_period = 1.0d0/freq
+  t_on  = duty * t_period
+  t_off = t_period - t_on
+  n_sub_on  = 12
+  n_sub_off = 8
+
+  ! ---------- init ----------
+  call ZDPlasKin_init()
+  call ZDPlasKin_set_config(ATOL=atol_in, RTOL=rtol_in)
+
+  ! total gas density at 1 atm [cm-3], scaled with T
+  ntot = 2.446d19 * (300.0d0/Tgas)
+
+  call ZDPlasKin_set_conditions(GAS_TEMPERATURE=Tgas, REDUCED_FIELD=EN_on)
+
+  ! ---------- 初始气体组成（向导生成时写入） ----------
+{{INIT_LINES}}
+
+  ! ---------- 电子（模板固定写法：全程恒定，物种名由模块自查；等价 ne_mode='fix'） ----------
+  call ZDPlasKin_set_density(trim(adjustl(species_name(species_electrons))), &
+       ne0, ldens_const=.true.)
+  feed_density = density
+  flow_enabled = 0
+  if (tau_res .gt. 0.0d0) flow_enabled = 1
+  if (flow_enabled .eq. 1) call ZDPlasKin_set_cstr_flow(tau_res, feed_density)
+  monitor_floor = max(1.0d4, 1.0d-12*ntot)
+  density_prev = density
+
+  ! ---------- NH3 定位（机制无关；机理无 NH3 时相关列恒为 0） ----------
+  nh3_idx = 0
+  do i = 1, species_max
+    if (trim(adjustl(species_name(i))) .eq. 'NH3') nh3_idx = i
+  end do
+  if (nh3_idx .eq. 0) then
+    write(*,*) 'WARNING: 机理中无 NH3，周期汇总 NH3 相关列恒为 0'
+  end if
+
+  write(*,*) '=== MAIN_AUTO_PULSE 脉冲放电自动计算 ==='
+  write(*,*) 'tag=', trim(tag), ' Tgas=', Tgas, ' EN_on=', EN_on, ' EN_off=', EN_off
+  write(*,*) 'freq=', freq, ' duty=', duty, ' n_max=', n_max
+  write(*,*) 't_period=', t_period, ' t_on=', t_on, ' t_off=', t_off
+  write(*,*) 'electron: ne_mode=fix ne0_cm-3=', ne0
+  write(*,*) 'convergence: rtol=', conv_rtol, ' min_cycles=', min_cycles, &
+             ' stable_required=', stable_required, ' monitor_floor_cm-3=', monitor_floor
+  write(*,*) 'flow: enabled=', flow_enabled, ' tau_res_s=', tau_res
+  write(*,*) 'flow integration: coupled CSTR source in ZDPlasKin RHS; chemistry substeps on=', n_sub_on, ' off=', n_sub_off
+
+  ! ---------- outputs ----------
+  u = 20
+  open(unit=u, file=series_csv, status='replace')
+  write(u,'(A)', advance='no') 'time_s,phase,Te_eV,EN_Td,Ptot'
+! @BLOCK:species_cols
+  do i = 1, species_max
+    write(u,'(A)', advance='no') ',' // trim(adjustl(species_name(i)))
+  end do
+! @ENDBLOCK:species_cols
+  write(u,*)
+
+  uc = 21
+  open(unit=uc, file=cycles_csv, status='replace')
+  write(uc,'(A)') 'cycle,t_end_s,NH3_start,NH3_after_on,NH3_end,E_on_Jcm3,E_off_Jcm3,dNH3_on,dNH3_off,rel_state_max,rel_dNH3_cycle,rel_energy_cycle,stable_streak,tau_res_s'
+
+! @BLOCK:rates
+  ur = 22
+  open(unit=ur, file=rates_csv, status='replace')
+  write(ur,'(A)') 'time_s,dt_s,cycle,phase,reaction,rate_cm-3s-1'
+! @ENDBLOCK:rates
+
+  time = 0.0d0
+  next_progress = 1.0d0
+  converged = 0
+  cycles_used = 0
+  e_cycle_prev = 0.0d0
+  rel_state_max = -1.0d0
+  rel_dnh3 = -1.0d0
+  rel_energy = -1.0d0
+  stable_streak = 0
+  call write_row(u, time, 0)
+
+  ! ================= cycle loop =================
+  do k = 1, n_max
+    ! ---- discharge phase ----
+    ! Restart DVODE only at the discontinuous E/N phase boundary.
+    call ZDPlasKin_set_conditions(REDUCED_FIELD=EN_on, SOFT_RESET=.true.)
+    call ZDPlasKin_set_density(trim(adjustl(species_name(species_electrons))), &
+         ne0, ldens_const=.true.)
+    nh3_start = 0.0d0
+    if (nh3_idx .gt. 0) nh3_start = density(nh3_idx)
+    e_on = 0.0d0
+    if (t_on .gt. 0.0d0) then
+      call integrate_phase(t_on, n_sub_on, time, e_on, 1)
+    end if
+    nh3_mid = 0.0d0
+    if (nh3_idx .gt. 0) nh3_mid = density(nh3_idx)
+    call write_row(u, time, 1)
+
+    ! ---- afterglow phase（duty=1 即 cw 时跳过，E_off 恒 0） ----
+    e_off = 0.0d0
+    if (t_off .gt. 0.0d0) then
+      call ZDPlasKin_set_conditions(REDUCED_FIELD=EN_off, SOFT_RESET=.true.)
+      call integrate_phase(t_off, n_sub_off, time, e_off, 2)
+    end if
+    do while (next_progress .le. time)
+      write(*,*) 'PROGRESS time =', next_progress
+      flush(6)
+      next_progress = next_progress + 1.0d0
+    end do
+    nh3_end = 0.0d0
+    if (nh3_idx .gt. 0) nh3_end = density(nh3_idx)
+    call write_row(u, time, 2)
+
+    dnh3_on  = nh3_mid - nh3_start
+    dnh3_off = nh3_end - nh3_mid
+    dnh3_tot = nh3_end - nh3_start
+    e_cycle = e_on + e_off
+    if (k .gt. 1) then
+      rel_state_max = 0.0d0
+      do i = 1, species_max
+        denom = max(abs(density(i)), abs(density_prev(i)), monitor_floor)
+        if (max(abs(density(i)), abs(density_prev(i))) .ge. monitor_floor) then
+          rel_state_max = max(rel_state_max, abs(density(i)-density_prev(i))/denom)
+        end if
+      end do
+      ! Periodic steady state requires zero net NH3 accumulation per cycle.
+      denom = max(abs(nh3_end), abs(nh3_start), monitor_floor)
+      rel_dnh3 = abs(dnh3_tot)/denom
+      denom = max(abs(e_cycle), abs(e_cycle_prev), 1.0d-30)
+      rel_energy = abs(e_cycle-e_cycle_prev)/denom
+      if (k .ge. min_cycles .and. rel_state_max .le. conv_rtol .and. &
+          rel_dnh3 .le. conv_rtol .and. rel_energy .le. conv_rtol) then
+        stable_streak = stable_streak + 1
+      else
+        stable_streak = 0
+      end if
+    end if
+    write(uc,'(I6,11(",",ES13.5),",",I6,",",ES13.5)') k, time, nh3_start, nh3_mid, nh3_end, e_on, e_off, &
+          dnh3_on, dnh3_off, rel_state_max, rel_dnh3, rel_energy, stable_streak, tau_res
+    cycles_used = k
+
+    if (stable_streak .ge. stable_required) then
+      converged = 1
+      exit
+    end if
+    e_cycle_prev = e_cycle
+    density_prev = density
+  end do
+
+! @BLOCK:rates
+  close(ur)
+! @ENDBLOCK:rates
+  close(u)
+  close(uc)
+
+  ! ---------- stdout summary ----------
+  write(*,*) 'DONE tag=', trim(tag)
+  write(*,*) 'cycles_used =', cycles_used, ' converged =', converged
+  write(*,*) 't_end =', time
+  if (nh3_idx .gt. 0) then
+    write(*,*) 'NH3 final (cm-3):', density(nh3_idx)
+  end if
+  write(*,*) 'dNH3/cycle last:', dnh3_tot, ' on:', dnh3_on, ' off:', dnh3_off
+  write(*,*) 'convergence last: rel_state_max=', rel_state_max, ' rel_dNH3=', rel_dnh3, &
+             ' rel_energy=', rel_energy, ' stable_streak=', stable_streak
+
+contains
+
+  subroutine integrate_phase(phase_dt, nsub, tcur, e_acc, iphase)
+    ! Chemistry and CSTR source terms are integrated together in ZDPlasKin RHS.
+    double precision, intent(in) :: phase_dt
+    integer, intent(in) :: nsub
+    double precision, intent(inout) :: tcur, e_acc
+    integer, intent(in) :: iphase
+    double precision :: dt1, dti
+    integer :: jj
+    dt1 = phase_dt*1.0d-4
+    dti = (phase_dt - dt1)/dble(nsub-1)
+    do jj = 1, nsub
+      if (jj .eq. 1) then
+        call ZDPlasKin_timestep(tcur, dt1)
+        tcur = tcur + dt1
+      else
+        call ZDPlasKin_timestep(tcur, dti)
+        tcur = tcur + dti
+      end if
+      call ZDPlasKin_get_conditions(ELEC_POWER_N=p_tot)
+! @BLOCK:rates
+      if (jj .eq. 1) then
+        if (iphase .eq. 1) then
+          call write_rates(ur, tcur, dt1, k, 'on')
+        else
+          call write_rates(ur, tcur, dt1, k, 'off')
+        end if
+      else
+        if (iphase .eq. 1) then
+          call write_rates(ur, tcur, dti, k, 'on')
+        else
+          call write_rates(ur, tcur, dti, k, 'off')
+        end if
+      end if
+! @ENDBLOCK:rates
+      if (jj .eq. 1) then; e_acc = e_acc + p_tot*dt1; else; e_acc = e_acc + p_tot*dti; end if
+    end do
+  end subroutine integrate_phase
+
+  subroutine write_row(uu, t, iphase)
+    integer, intent(in) :: uu, iphase
+    double precision, intent(in) :: t
+    double precision :: te, en, pt
+    integer :: kk
+    call ZDPlasKin_get_conditions(ELEC_TEMPERATURE=te, REDUCED_FIELD=en, &
+         ELEC_POWER_N=pt)
+    write(uu,'(ES13.5,",",I1,",",ES13.5,",",ES13.5,",",ES13.5)', advance='no') &
+         t, iphase, te/11604.5d0, en, pt
+! @BLOCK:species_cols
+    do kk = 1, species_max
+      write(uu,'(",",ES13.5)', advance='no') density(kk)
+    end do
+! @ENDBLOCK:species_cols
+    write(uu,*)
+  end subroutine write_row
+
+! @BLOCK:rates
+  subroutine write_rates(uu, t, dt_sample, icycle, phase)
+    ! Sample the actual right endpoint of a solver substep.  dt_sample permits
+    ! direct right-rule integration without advancing the final state.
+    integer, intent(in) :: uu, icycle
+    double precision, intent(in) :: t, dt_sample
+    character(len=*), intent(in) :: phase
+    integer :: rr
+    call ZDPlasKin_get_rates(REACTION_RATES=rates)
+    do rr = 1, reactions_max
+      write(uu,'(ES13.5,",",ES13.5,",",I6,",",A,",",A,",",ES13.5)') t, dt_sample, icycle, trim(phase), &
+           '"'//trim(adjustl(reaction_sign(rr)))//'"', rates(rr)
+    end do
+  end subroutine write_rates
+! @ENDBLOCK:rates
+
+end program main_auto_pulse

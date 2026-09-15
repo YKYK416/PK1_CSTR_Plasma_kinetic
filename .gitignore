@@ -1,0 +1,44 @@
+# This repository intentionally contains only source code, templates, licenses,
+# and Markdown documentation. Runtime inputs and generated research outputs stay local.
+*
+!.gitignore
+!README.md
+!**/
+!**/*.md
+!**/*.py
+!**/*.f90
+!**/*.F90
+!**/*.tmpl
+!**/*.sh
+!**/*.bat
+!**/LICENSE
+!**/LICENSE.*
+
+# Python caches and common generated artefacts.
+__pycache__/
+*.py[cod]
+*.o
+*.mod
+*.exe
+*.dll
+*.lib
+*.log
+*.bin
+
+# This is an independently versioned upstream repository.
+/Hong/Reproduction/external_models/DFT-microkinetic/
+
+# Simulation workspaces and generated analysis trees contain copied source,
+# per-run notes, and numerical outputs. The maintained source lives under
+# Hong/工具脚本 and the reproduction roots instead.
+/Gas/
+/GasReaction/
+/Hong/analysis/
+/Hong/Reproduction/2017Hong/**/build/
+/Hong/Reproduction/2017Hong/**/build_*/
+/Hong/Reproduction/2017Hong/**/diagnostics/
+/Hong/Reproduction/2017Hong/**/runs/
+/Hong/Shao2024_JACSAu/dft_microkinetic_windows_case/
+/Hong/Shao2024_JACSAu/reproduction/cases/
+/Hong/Shao2024_JACSAu/reproduction/cases_*/
+/Hong/Shao2024_JACSAu/reproduction/results/

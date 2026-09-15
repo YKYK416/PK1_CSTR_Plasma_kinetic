@@ -1,0 +1,173 @@
+! ============================================================
+! MAIN_AUTO — 通用主程序（zdp_gui 向导生成，模板渲染，勿手改本标记行）
+! 恒定 E/N 单点版；CLI: Tgas_K EN_Td t_end_s tag [ATOL RTOL]
+! 初始气体组成在生成时写入（摩尔分数 × 总密度）
+! 输出: auto_output_<tag>.csv / auto_rates_<tag>.csv / auto_rates_t_<tag>.csv
+! （输出开关块标记仅为注释，生成时已移除，不影响编译）
+! ============================================================
+program main_auto
+  use ZDPlasKin
+  implicit none
+
+  double precision :: time, dtime, dt_next, factor, time_end, next_progress
+  double precision :: ntot, Te_K, EN_now
+  double precision :: p_tot, p_elast, p_inel
+  double precision :: rates(reactions_max)
+  double precision :: Tgas, EN_set
+  double precision :: atol_in, rtol_in
+  double precision :: snap_times(7)
+  integer :: i, u, ur, iargc, isnap, urt
+  character(len=128) :: arg, out_csv, rates_csv, rates_t_csv
+
+  ! ---------- command line: Tgas_K EN_Td t_end_s tag ----------
+  Tgas     = {{TG}}
+  EN_set   = {{EN}}
+  time_end = {{TEND}}
+  out_csv   = 'auto_output.csv'
+  rates_csv = 'auto_rates.csv'
+  rates_t_csv = 'auto_rates_t.csv'
+  if (iargc() .ge. 1) then
+    call getarg(1, arg); read(arg, *) Tgas
+  end if
+  if (iargc() .ge. 2) then
+    call getarg(2, arg); read(arg, *) EN_set
+  end if
+  if (iargc() .ge. 3) then
+    call getarg(3, arg); read(arg, *) time_end
+  end if
+  if (iargc() .ge. 4) then
+    call getarg(4, arg)
+    out_csv   = 'auto_output_'   // trim(arg) // '.csv'
+    rates_csv = 'auto_rates_'    // trim(arg) // '.csv'
+    rates_t_csv = 'auto_rates_t_'// trim(arg) // '.csv'
+  end if
+  ! optional args 5/6: ATOL RTOL (for numerically stiff points)
+  atol_in = 1.0d0
+  rtol_in = 1.0d-4
+  if (iargc() .ge. 5) then
+    call getarg(5, arg); read(arg, *) atol_in
+  end if
+  if (iargc() .ge. 6) then
+    call getarg(6, arg); read(arg, *) rtol_in
+  end if
+
+  ! ---------- init ----------
+  call ZDPlasKin_init()
+  call ZDPlasKin_set_config(ATOL=atol_in, RTOL=rtol_in)
+
+  ! total gas density at 1 atm [cm-3], scaled with T
+  ntot = 2.446d19 * (300.0d0/Tgas)
+
+  call ZDPlasKin_set_conditions(GAS_TEMPERATURE=Tgas, REDUCED_FIELD=EN_set)
+
+  ! ---------- 初始气体组成（向导生成时写入） ----------
+{{INIT_LINES}}
+
+  ! ---------- 电子（模板固定写法：初始密度恒定，物种名由模块自查） ----------
+  call ZDPlasKin_set_density(trim(adjustl(species_name(species_electrons))), &
+       {{NE}}, ldens_const=.true.)
+
+  ! ---------- output files ----------
+  u = 20
+  open(unit=u, file=out_csv, status='replace')
+  write(u,'(A)', advance='no') 'time_s'
+! @BLOCK:te_col
+  write(u,'(A)', advance='no') ',Te_eV'
+! @ENDBLOCK:te_col
+  write(u,'(A)', advance='no') ',EN_Td,Ptot,Pelast,Pinel'
+! @BLOCK:species_cols
+  do i = 1, species_max
+    write(u,'(A)', advance='no') ',' // trim(adjustl(species_name(i)))
+  end do
+! @ENDBLOCK:species_cols
+  write(u,*)
+
+! @BLOCK:rates_t
+  urt = 22
+  open(unit=urt, file=rates_t_csv, status='replace')
+  write(urt,'(A)') 'time_s,reaction,rate_cm-3s-1'
+! @ENDBLOCK:rates_t
+
+  snap_times = (/ 1.0d-6, 1.0d-4, 1.0d-2, 1.0d-1, 1.0d0, 1.0d1, 1.0d2 /)
+  isnap = 1
+
+  ! ---------- time integration: 1e-9 s -> time_end, log spaced ----------
+  time   = 0.0d0
+  dtime  = 1.0d-9
+  factor = 10.0d0**0.1d0
+  next_progress = 1.0d0
+
+  call ZDPlasKin_get_conditions(ELEC_TEMPERATURE=Te_K, REDUCED_FIELD=EN_now, &
+       ELEC_POWER_N=p_tot, ELEC_POWER_ELASTIC_N=p_elast, ELEC_POWER_INELASTIC_N=p_inel)
+  call write_row(u, time, Te_K, EN_now, p_tot, p_elast, p_inel)
+
+  do while (time .lt. time_end)
+    dt_next = min(dtime, time_end - time)
+    call ZDPlasKin_timestep(time, dt_next)
+    time = time + dt_next
+    do while (next_progress .le. time .and. next_progress .le. time_end)
+      write(*,*) 'PROGRESS time =', next_progress
+      flush(6)
+      next_progress = next_progress + 1.0d0
+    end do
+
+    call ZDPlasKin_get_conditions(ELEC_TEMPERATURE=Te_K, REDUCED_FIELD=EN_now, &
+         ELEC_POWER_N=p_tot, ELEC_POWER_ELASTIC_N=p_elast, ELEC_POWER_INELASTIC_N=p_inel)
+    call write_row(u, time, Te_K, EN_now, p_tot, p_elast, p_inel)
+
+! @BLOCK:rates_t
+    do while (isnap .le. 7)
+      if (time .lt. snap_times(isnap)) exit
+      call ZDPlasKin_get_rates(REACTION_RATES=rates)
+      do i = 1, reactions_max
+        write(urt,'(ES13.5,",",A,",",ES13.5)') snap_times(isnap), &
+             '"'//trim(adjustl(reaction_sign(i)))//'"', rates(i)
+      end do
+      isnap = isnap + 1
+    end do
+! @ENDBLOCK:rates_t
+
+    dtime = dtime * factor
+    if (dtime .gt. 10.0d0) dtime = 10.0d0
+  end do
+  close(u)
+! @BLOCK:rates_t
+  close(urt)
+! @ENDBLOCK:rates_t
+
+! @BLOCK:rates
+  ! ---------- final reaction rates ----------
+  call ZDPlasKin_get_rates(REACTION_RATES=rates)
+  ur = 21
+  open(unit=ur, file=rates_csv, status='replace')
+  write(ur,'(A)') 'reaction,rate_cm-3s-1'
+  do i = 1, reactions_max
+    write(ur,'(A,",",ES13.5)') '"'//trim(adjustl(reaction_sign(i)))//'"', rates(i)
+  end do
+  close(ur)
+! @ENDBLOCK:rates
+
+  write(*,*) 'DONE. Tgas =', Tgas, ' EN =', EN_set, ' t_end =', time
+  call ZDPlasKin_get_conditions(ELEC_TEMPERATURE=Te_K)
+  write(*,*) 'Te  final (eV):', Te_K/11604.5d0
+
+contains
+
+  subroutine write_row(uu, t, te, en, pt, pel, pin)
+    integer, intent(in) :: uu
+    double precision, intent(in) :: t, te, en, pt, pel, pin
+    integer :: k
+    write(uu,'(ES13.5)', advance='no') t
+! @BLOCK:te_col
+    write(uu,'(",",ES13.5)', advance='no') te/11604.5d0
+! @ENDBLOCK:te_col
+    write(uu,'(",",ES13.5,",",ES13.5,",",ES13.5,",",ES13.5)', advance='no') en, pt, pel, pin
+! @BLOCK:species_cols
+    do k = 1, species_max
+      write(uu,'(",",ES13.5)', advance='no') density(k)
+    end do
+! @ENDBLOCK:species_cols
+    write(uu,*)
+  end subroutine write_row
+
+end program main_auto
