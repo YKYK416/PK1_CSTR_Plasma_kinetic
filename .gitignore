@@ -13,6 +13,7 @@
 !**/*.bat
 !**/LICENSE
 !**/LICENSE.*
+!core/templates/*.inp
 
 # Python caches and common generated artefacts.
 __pycache__/
@@ -28,10 +29,13 @@ __pycache__/
 # This is an independently versioned upstream repository.
 /Hong/Reproduction/external_models/DFT-microkinetic/
 
+# Local ZDPlasKin distribution retained for GUI builds; tracked source lives in core/packages.
+/Hong/1.ZDPlasKin/
+
 # Simulation workspaces and generated analysis trees contain copied source,
-# per-run notes, and numerical outputs. The maintained source lives under
-# Hong/工具脚本 and the reproduction roots instead.
-/Gas/
+# per-run notes, and numerical outputs. The maintained source now lives in
+# core/, gas/, and surface/; these legacy workspaces remain local inputs.
+/Gas/_reaction/
 /GasReaction/
 /Hong/analysis/
 /Hong/Reproduction/2017Hong/**/build/
