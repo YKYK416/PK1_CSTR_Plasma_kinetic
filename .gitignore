@@ -46,3 +46,25 @@ __pycache__/
 /Hong/Shao2024_JACSAu/reproduction/cases/
 /Hong/Shao2024_JACSAu/reproduction/cases_*/
 /Hong/Shao2024_JACSAu/reproduction/results/
+
+# Numerical campaign outputs are a local archive. Keep only the small
+# directory guides in Git; CSV, logs, SQLite files, figures, and case trees
+# below result/ stay out of the repository.
+/result/*
+!/result/README.md
+!/result/gas/
+!/result/surface/
+/result/gas/*
+!/result/gas/0d/
+!/result/gas/0d-cstr/
+/result/surface/*
+!/result/surface/0d/
+!/result/surface/0d-cstr/
+/result/gas/0d/*
+!/result/gas/0d/README.md
+/result/gas/0d-cstr/*
+!/result/gas/0d-cstr/README.md
+/result/surface/0d/*
+!/result/surface/0d/README.md
+/result/surface/0d-cstr/*
+!/result/surface/0d-cstr/README.md
