@@ -16,6 +16,15 @@
 
 求解器和通用运行时位于 `core/`。Hong 原始输入、编译目录和历史结果仍在本机 `Hong/` 工作区，Git 仅保存可维护脚本和说明。
 
+## 结果归档
+
+- 生产 campaign `campaign_hong_closed0d_100s_production_20260912_r02` 已归档至
+  `result/surface/0d/`。
+- 该扫描覆盖 972 个工况，全部完成并通过台账状态检查；最终汇总、图件说明和
+  本次计算交接文件位于其 `analysis_final_20260914/` 子目录。
+- `Hong/analysis/` 中较早的 r01 与 self-test 目录保留为历史诊断工作区，不作为
+  当前生产结果的归档版本。
+
 ## 交接检查
 
 1. 确认运行边界为 closed 0D，而不是 CSTR。
